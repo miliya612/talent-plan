@@ -1,0 +1,90 @@
+# PingCap/talent_plan/bb2/damn_cool_algorithms_log_structured_storage
+
+- 14 December, 2009
+- http://blog.notdot.net/2009/12/Damn-Cool-Algorithms-Log-structured-storage
+
+- ストレージシステムを構築する上で、最もメジャーな懸念点は、disk上にどのようにdataを保持するか、ということ
+    - data保持のためのスペース確保、及びdataのindexの保存について考えなければならない
+        - 既存のオブジェクトを拡張するときには？(e.g. fileにappendする)
+        - フラグメンテーションは？
+            - 古いオブジェクトが消去され、新しいものが代わりに保存される際に発生する問題
+    - 対処すると非常に複雑になってしまい、解決しようにもバグが混じったり充分でなかったりする
+- `Log structured storage`
+    - Log structured file system(1980's)に由来する
+    - 最近になってDBエンジンの構造としてよく採用されているのを散見するようになってきている
+    - 原型となったfilesystemアプリケーション
+        - 汎用的な利用を妨げる欠点に悩まされていた
+        - DBエンジンにとっては微々たる問題だった
+    - 簡単なストレージ管理を上回るメリットをもたらした
+- 基本的な構成
+    - `log` : append専用のdata entryのsequence
+    - dataを新しく書き込む時にはいつでも、diskから書き込み箇所を探し当てるかわりに、logの後ろにただappendするだけでよい
+    - dataのindexはmetadataによって扱われ、metadataはdata同様logにappendされていく
+    - 書き込みに伴ってupdateするindex nodeの数は概して非常に少なくて済む
+        - disk baseのindex構成(e.g. B-tree)の場合、広範囲に渡ってupdateする必要が出てくる
+- 構造
+    - dataの追加
+        - dataを追加すると、data本体とindex(metadata)がセットで書き込まれる
+        - 次の要素を追加すると、新しいdata本体と更新されたindex(metadata)がlogの終わりにappendされる
+            - 元のindexもlogの中に存在するが、これ以上利用されない
+        - rootのindex(現在有効なindex?)を探し出すのは高速
+            - 素朴なapproachは単純に最後の要素を取り出すこと
+                - 探索中に別プロセスが新しいlogを書き込んでしまう恐れがある
+            - logの先頭に現在のroot nodeを指し示すpointerを持つnodeを用意する
+                - 書き込みのたびに最初のnodeは更新される
+    - dataの更新
+        - 既存の要素の完全にコピーした更新dataをlogの末尾に書き込み、合わせて最新のindexもappendする
+            - 古いdataはLogの中に存在し続けるが、indexはそれを参照しない
+    - 問題点
+        - 必要なストレージの容量が増え続けることになる
+            - filesystemの場合、diskをcircular bufferとして扱い、古いdataを上書きする
+                - 更新dataも新しいvalidなdataとしてappendされ続ける
+                - 新しいdataをappendするたびに古いdataを上書く
+        - 一般のfilesystemにおいて頭を悩ませるポイント
+            - disk空き容量が減るにつれて、GCに要する時間が増加する
+            - 先頭に戻って書き込むことが増える
+            - diskの80%を使い切るとfilesystemが動かなくなる
+        - log structured storageをDBエンジン向けに使うのであれば問題にならない
+            - 一般のfilesystemの上にlog structured storageを構築することで、特性を有効活用できる
+            - DBを複数の固定長chunkに分割したとき、いくつかspaceを再利用する必要があるなら、1つchunkを選び出してそこに全ての有効なdataをrewriteし、不要となったchunkを削除する
+            - メリット
+                - 最も古いsegmentだけでなく、途中のものを選択してGCできる
+                    - あるdataはずっと存在しつづけ、一方あるdataは繰り返し上書かれ続けるDBにおいてこの性質は特に有用
+                - GCやそれに伴う作業を最小限にできる
+                    - GCを実際に行う前にsegmentがほとんど使用されなくなるまで待つため
+                - transactionの一貫性を保つため、DBは一般的に `Write Ahead Log` を用いる
+                    - DBがtransactionをdiskに永続化する際、まずは全ての変更をWALに書き込み、その後diskにflushして、実際のDBファイルを更新する
+                    - WALに記録された変更履歴を再度適用することで障害復旧できる
+                    - log structured storageを用いるとき、WALはDBファイルとなる
+                        - dataは一回だけ書けばよいことになる
+                    - recoveryのとき、ただDBを開き、最後に記録されたindex headerから一方向に前方探索しながら、dataから欠落しているindexのupdateを再構築していく
+                - log structured storageを用いたWALによるrecoveryを活用して、書き込みを更に最適化することができる
+                    - 書き込みの度にindex nodeへの書き込みを行うのではなく、それらをmemoryにcacheし、一定のタイミングのみにdiskに書き込むようにする
+                    - 処理が完了したtransactionと未完のものとを区別する手段をもちうる限り、私達のrecovery方法は障害の際にdataを再構築する
+                - backupもこのrecovery方式によって簡易に成し遂げられる
+                    - それぞれのlogのsegmentを完了したtransactionとして他のメディアに複製することで、継続的にincrementalなDBのbackupが可能
+                - DBのconcurrencyとtransactionのsemanticsに関するメリット
+                    - transactionの一貫性をもたらすため、ほとんどのDBは複雑なlockの仕組みを用いて、どのprocessがいつdataを更新できるのかをコントロールする
+                        - 必要とされる一貫性のレベルに応じて、書き込みのためにlockを取得するwriterだけでなく、lockを取得して読み込み中にdataが改変されないことを確実にするreaderが影響を及ぼしうる
+                        - これにより、比較的書き込みのrateが低くとも、ある程度のconcurrentなreadが発生している状況ではperformanceの低下を招く恐れがある
+                    - `Multiversion Concurrency Control(MVCC)` を用いてこの状況に対応できる
+                        - nodeがDBからdataを読み込みたいときはいつでも、現在のroot index nodeを探し出し、残りのtransactionのためにそのnodeを用いる？
+                        - log-based storage systemでは既存のdataは決して改変されないため、processはhandle(lockと同じ？)を取得した時点での各タイミングにおけるDBのsnapshotを保持する
+                            - いかなるconcurrentなtransactionもこのDBのviewに影響を及ぼすことはできない
+                            - このようにして、lockから開放された読み込みを手に入れる
+                    - dataのrollbackに関しては、`Optimistic concurrency` を活用できる
+                        - 典型的なread-modify-writeの一巡において、まずreadを行い、書き込みのためのDB lockを取得し、最初に読み込んだdataの全てが変更されていないことを検証する
+                        - indexを参照することで、これらの手順を素早く行い、取り扱っているdataへのaddressが最後に読み込んだときと同じことを確認できる
+                        - もしaddressが同じであれば、書き込みが無かったことになり、自身の変更を加えることができる
+                        - もし違ったら、transactionのconflictが発生していることになり、ただrollbackしてreadのphaseからやり直す
+- log structured アルゴリズムを用いた例
+    - the Java port, `BDB-JE`
+        - 起源となった `Berkeley DB` はかなり一般的な設計を採用しているが、これはまさに説明したような設計を用いている
+    - `CouchDB`
+        - 説明したようなsystemを用いているが、例外がある
+            - logをsegmentへと分割してGCを行う代わりに、古くなったデータがある程度蓄積されたら、DB全体をrewriteする
+    - `PostgreSQL`
+        - MVCCを用いており、また解説したようなincrementalなbackupの手法を取るようにWALが構成されている
+    - `AppEngine`
+        - BigTableを元にしている
+            - disk上のstorageに関して別のアプローチを取っているが、transaction層においてoptimistic concurrencyを採用している
